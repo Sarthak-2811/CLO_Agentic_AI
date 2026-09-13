@@ -29,3 +29,4 @@ langchain-text-splitters>=0.3.0
 
 # --- PDF Generation (Mock Test Data) ---
 reportlab>=4.0.0
+streamlit

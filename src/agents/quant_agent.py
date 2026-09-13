@@ -39,12 +39,17 @@ RULES:
 1. You MUST use `numpy` and `pandas`. Simulate 10,000 paths (n_paths=10000).
 2. Use the provided JSON Indenture Rules to set tranche sizes, triggers, and spreads.
 3. Calculate the probability of default (dollar loss > 0) for EACH tranche.
-4. DO NOT make network calls. Assume a flat default correlation matrix. 
-5. ASSUME a 2.0% base annual default probability for the underlying loans and a 70% recovery rate upon default.
-6. You MUST print the final result to standard output using `print(json.dumps(results_dict))`. The keys must be the tranche class names, and the values must be the probability of loss (a float between 0.0 and 1.0).
-7. DO NOT embed the raw JSON string in your code. Instead, extract the specific tranche sizes, spreads, and triggers from the provided rules and define them directly as Python variables (e.g. `tranche_A_size = 100000000`).
-8. Output ONLY pure Python code. Do not wrap it in markdown block quotes (```python). Just the code.
-9. You MUST include `import json` at the top of your script.
+4. IMPORTANT WATERFALL LOSS ORDER: Losses are absorbed BOTTOM-UP. 
+   - Subordinated (Equity) takes the FIRST losses (Threshold = 0).
+   - Mezzanine/Junior tranches (e.g. Class C, then Class B) take the NEXT losses.
+   - Senior tranches (e.g. Class A-1 / AAA) take the LAST losses.
+   Do NOT reverse this order. Your cumulative thresholds for loss absorption must reflect this bottom-up sequence.
+5. DO NOT make network calls. Assume a flat default correlation matrix. 
+6. ASSUME a 2.0% base annual default probability for the underlying loans and a 70% recovery rate upon default.
+7. You MUST print the final result to standard output using `print(json.dumps(results_dict))`. The keys must be the tranche class names, and the values must be the probability of loss (a float between 0.0 and 1.0).
+8. DO NOT embed the raw JSON string in your code. Instead, extract the specific tranche sizes, spreads, and triggers from the provided rules and define them directly as Python variables (e.g. `tranche_A_size = 100000000`).
+9. Output ONLY pure Python code. Do not wrap it in markdown block quotes (```python). Just the code.
+10. You MUST include `import json` at the top of your script.
 """
 
     prompt = ChatPromptTemplate.from_messages([
