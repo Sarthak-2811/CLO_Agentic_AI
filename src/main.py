@@ -64,8 +64,15 @@ def route_after_critic(state: GraphState) -> str:
     return "quant_node"
 
 
-def build_clo_graph():
-    """Builds and compiles the cyclic LangGraph workflow."""
+def build_clo_graph(checkpointer=None):
+    """
+    Builds and compiles the cyclic LangGraph workflow.
+
+    Args:
+        checkpointer: Optional LangGraph checkpointer (e.g. SqliteSaver) for
+                      persisting per-thread state across sessions. When provided,
+                      each invocation must include a config with a unique thread_id.
+    """
     workflow = StateGraph(GraphState)
 
     # 1. Register Nodes
@@ -81,7 +88,7 @@ def build_clo_graph():
     workflow.add_conditional_edges("critic_node", route_after_critic)
     workflow.add_edge("reporter_node", END)
 
-    return workflow.compile()
+    return workflow.compile(checkpointer=checkpointer)
 
 
 if __name__ == "__main__":

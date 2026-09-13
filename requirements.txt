@@ -1,5 +1,6 @@
 # --- LangChain & Graph Orchestration ---
 langgraph>=0.2.0
+langgraph-checkpoint-sqlite>=2.0.0   # Thread persistence via SQLite checkpointer
 langchain>=0.3.0
 langchain-core>=0.3.0
 langchain-community>=0.3.0
