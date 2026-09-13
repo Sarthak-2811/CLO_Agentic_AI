@@ -98,6 +98,7 @@ if __name__ == "__main__":
     initial_state: GraphState = {
         "pdf_path": pdf_file,
         "extracted_text_chunks": [],
+        "vector_store_id": None,
         "parsed_waterfall": None,
         "senior_tranche_ratio": 0.65,
         "default_correlation": 0.20,

@@ -8,6 +8,10 @@ class GraphState(TypedDict):
     pdf_path: str
     extracted_text_chunks: List[str]
 
+    # RAG vector store identifier (ChromaDB collection name for this document)
+    # Each PDF gets its own isolated collection to prevent cross-document contamination.
+    vector_store_id: Optional[str]
+
     # Extracted legal structure (from Parser Node)
     # Stored as a plain dict (Pydantic model serialized via .model_dump())
     parsed_waterfall: Optional[Dict[str, Any]]
@@ -27,6 +31,6 @@ class GraphState(TypedDict):
     iteration_count: int
     max_iterations: int
     status: str                           # 'pending', 'approved', or 'rejected'
-    
+
     # Final Executive Summary (from Reporter Node)
     final_report: Optional[str]
