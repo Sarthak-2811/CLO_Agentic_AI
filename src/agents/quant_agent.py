@@ -28,7 +28,7 @@ def quant_agent(state: GraphState) -> Dict[str, Any]:
 
     # Groq LLM (Using 20B for strong coding logic and higher rate limits)
     llm = ChatGroq(
-        model="openai/gpt-oss-20b",
+        model="openai/gpt-oss-120b",
         temperature=0.0
     )
 

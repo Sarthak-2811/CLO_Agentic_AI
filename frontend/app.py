@@ -44,6 +44,7 @@ if pdf_path and st.button("🚀 Run Workflow"):
         "iteration_count": 0,
         "max_iterations": MAX_ITERATIONS,
         "generated_code": "",
+        "final_report": "",
     }
     
     with st.spinner("Agents are analyzing the PDF and simulating the waterfall... (This may take a minute)"):
@@ -64,6 +65,11 @@ if pdf_path and st.button("🚀 Run Workflow"):
     st.write("### 📝 Critic Agent Assessment")
     st.info(final_state.get("critic_feedback", "None provided."))
     
+    if final_state.get("final_report"):
+        st.write("---")
+        st.write("### 📑 Executive Summary")
+        st.markdown(final_state.get("final_report"))
+
     st.write("---")
     
     # Expandable sections for detailed data

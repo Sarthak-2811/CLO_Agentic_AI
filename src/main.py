@@ -11,6 +11,7 @@ from src.state import GraphState
 from src.agents.parser_agent import parser_agent
 from src.agents.quant_agent import quant_agent
 from src.agents.critic_agent import critic_agent
+from src.agents.reporter_agent import reporter_agent
 
 load_dotenv()
 
@@ -53,7 +54,7 @@ def route_after_critic(state: GraphState) -> str:
 
     if status == "approved":
         print(f"[✓] Model Approved by Rating Agency Critic at iteration {iteration}!")
-        return END
+        return "reporter_node"
 
     if iteration >= MAX_ITERATIONS:
         print(f"[!] Convergence limit reached without approval. Terminating graph.")
@@ -71,12 +72,14 @@ def build_clo_graph():
     workflow.add_node("parser_node", parser_agent)
     workflow.add_node("quant_node", quant_agent)
     workflow.add_node("critic_node", critic_agent)
+    workflow.add_node("reporter_node", reporter_agent)
 
     # 2. Register Edges
     workflow.add_edge(START, "parser_node")
     workflow.add_conditional_edges("parser_node", route_after_parser)
     workflow.add_conditional_edges("quant_node", route_after_quant)
     workflow.add_conditional_edges("critic_node", route_after_critic)
+    workflow.add_edge("reporter_node", END)
 
     return workflow.compile()
 
@@ -106,6 +109,7 @@ if __name__ == "__main__":
         "iteration_count": 0,
         "max_iterations": MAX_ITERATIONS,
         "status": "pending",
+        "final_report": None,
     }
 
     app = build_clo_graph()
@@ -121,3 +125,5 @@ if __name__ == "__main__":
     print(f"Iterations Run: {final_state.get('iteration_count')}")
     print(f"Critic Assessment: {final_state.get('critic_feedback')}")
     print(f"Tranche Results: {final_state.get('simulation_results')}")
+    print("\n--- Executive Summary ---")
+    print(final_state.get('final_report'))

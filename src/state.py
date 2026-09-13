@@ -27,3 +27,6 @@ class GraphState(TypedDict):
     iteration_count: int
     max_iterations: int
     status: str                           # 'pending', 'approved', or 'rejected'
+    
+    # Final Executive Summary (from Reporter Node)
+    final_report: Optional[str]
