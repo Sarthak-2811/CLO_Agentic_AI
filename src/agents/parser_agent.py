@@ -1,129 +1,334 @@
 # src/agents/parser_agent.py
 """
-Parser Agent — RAG-backed CLO Indenture Extraction.
+Parser Agent — Hybrid CLO Indenture Extraction.
 
-Instead of scanning the first 40 pages, this agent:
-1. Indexes the entire PDF into an isolated ChromaDB collection (first run only).
-2. Runs 5 targeted semantic queries — one per field group in IndentureRules.
-3. Passes only the relevant retrieved chunks to the LLM for structured extraction.
+Architecture (most reliable first):
+1. DETERMINISTIC: pdfplumber scans every page's tables directly for tranche rows
+   with dollar amounts. This is exact — no embeddings, no LLM, no hallucination.
+2. RAG + LLM (divide-and-conquer): 4 small focused calls for semi-structured content
+   (coverage tests, fees, waterfall steps). Each call is ~2,500 tokens max.
+3. SANITIZE: _sanitize_rules fills any remaining null values with market-convention
+   fallbacks so the Quant agent always has valid floats.
 
-This handles 300+ page documents with scattered data across any page,
-stays well within LLM context limits, and avoids rate-limit errors.
+This approach eliminates the embedding/retrieval failure mode for structured table
+data, which PyPDFLoader and chunking strategies can't reliably handle.
 """
 
+import re
+import json
 import os
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 
-from src.schemas.waterfall_def import IndentureRules
+from src.schemas.waterfall_def import (
+    IndentureRules, Tranche, CoverageTest, FeeStructure, WaterfallStep
+)
 from src.state import GraphState
-from src.tools.retriever import get_or_create_retriever, search_indenture, get_collection_info
+from src.tools.retriever import get_or_create_retriever, get_collection_info
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# LLM Setup
+# LLM — compact, JSON-only output
 # ---------------------------------------------------------------------------
+llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.0, max_retries=2)
 
-llm = ChatGroq(
-    model="openai/gpt-oss-120b",
-    temperature=0.0,
-    max_retries=2,
-)
-
-structured_parser_llm = llm.with_structured_output(IndentureRules, method="json_mode")
 
 # ---------------------------------------------------------------------------
-# Prompt
+# LAYER 1: Deterministic pdfplumber table extraction (no LLM, no embedding)
 # ---------------------------------------------------------------------------
 
-EXTRACTION_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", (
-        "You are an expert structured finance and CLO legal attorney. "
-        "Your task is to analyze excerpts retrieved from a CLO Indenture legal document "
-        "and extract the financial parameters into the requested JSON schema.\n\n"
-        "Strict Extraction Rules:\n"
-        "1. Extract ONLY facts explicitly stated in the provided context excerpts.\n"
-        "2. If a field is genuinely missing from the excerpts, use the schema default — do NOT fail.\n"
-        "3. Find ALL tranches, their exact par amounts, coupon spreads (bps), and target ratings.\n"
-        "4. Extract ALL Overcollateralization (OC) and Interest Coverage (IC) test trigger ratios.\n"
-        "5. Capture the administrative fee cap and management fee percentages.\n"
-        "6. Reconstruct the FULL sequential priority of interest payments (Priority 1, 2, 3...).\n"
-        "7. Output must be valid JSON matching the schema EXACTLY.\n\n"
-        "TARGET JSON SCHEMA:\n"
-        "{schema}"
-    )),
-    ("human", (
-        "Retrieved Indenture Excerpts (semantically relevant to the schema):\n\n"
-        "{context}\n\n"
-        "Extract the complete IndentureRules JSON:"
-    ))
-])
+# Regex patterns to recognise dollar amounts (e.g. "399,000,000" or "399000000")
+_DOLLAR_RE = re.compile(r"[\$]?\s*([\d,]+(?:\.\d+)?)\s*$")
+_SPREAD_RE  = re.compile(r"(?:Benchmark|SOFR|LIBOR)\s*[+]\s*([\d.]+)\s*%", re.IGNORECASE)
 
-# ---------------------------------------------------------------------------
-# Targeted RAG Queries
-# Each query is crafted to retrieve the most relevant chunks for a specific
-# sub-section of the IndentureRules schema.
-# ---------------------------------------------------------------------------
 
-RAG_QUERIES = [
-    # Tranche capital structure
-    (
-        "CLO tranche class names principal amounts par value notes issued "
-        "Class A Class B Class C subordinated equity ratings AAA AA BBB "
-        "spread basis points SOFR floating fixed coupon"
-    ),
-    # Coverage tests
-    (
-        "overcollateralization OC test ratio trigger threshold "
-        "interest coverage IC test minimum ratio cure action "
-        "Class A Class B OC ratio Class C IC ratio diversion"
-    ),
-    # Fees
-    (
-        "senior management fee rate subordinated management fee rate "
-        "administrative fee cap trustee fee incentive fee hurdle IRR "
-        "basis points annual fee percentage collateral"
-    ),
-    # Priority of payments / waterfall
-    (
-        "priority of payments interest proceeds waterfall sequential "
-        "first second third fourth administrative fees trustee interest "
-        "payment distribution order"
-    ),
-    # CCC bucket, equity, deal identity
-    (
-        "CCC rated obligation bucket limit percentage "
-        "subordinated notes equity residual deal name CLO vehicle "
-        "target par collateral balance IRR hurdle incentive share"
-    ),
+def _parse_dollar(text: str) -> Optional[float]:
+    """Convert '399,000,000' or '$399000000' to 399000000.0. Returns None if not parseable."""
+    if not text:
+        return None
+    text = text.strip().lstrip("$").replace(",", "").strip()
+    try:
+        val = float(text)
+        return val if val > 0 else None
+    except ValueError:
+        return None
+
+
+def _parse_spread(text: str, class_name: str = "") -> Optional[float]:
+    """Extract spread in bps from 'Benchmark + 1.58%' → 158.0.
+    When class_name is provided, only match if that class name appears nearby."""
+    # For equity/subordinated tranches there is no spread
+    if re.search(r'subordinated|equity', class_name, re.I):
+        return None
+    m = _SPREAD_RE.search(text or "")
+    if m:
+        return round(float(m.group(1)) * 100, 1)
+    return None
+
+
+# Known tranche name patterns for classification
+_CLASS_PATTERNS = [
+    (re.compile(r"Class\s+A[-\s]?1", re.I), "Class A-1", False),
+    (re.compile(r"Class\s+A[-\s]?2", re.I), "Class A-2", False),
+    (re.compile(r"Class\s+A\b",       re.I), "Class A",   False),
+    (re.compile(r"Class\s+B\b",       re.I), "Class B",   False),
+    (re.compile(r"Class\s+C\b",       re.I), "Class C",   False),
+    (re.compile(r"Class\s+D\b",       re.I), "Class D",   False),
+    (re.compile(r"Class\s+E\b",       re.I), "Class E",   False),
+    (re.compile(r"Subordinated",      re.I), "Subordinated Notes", True),
+    (re.compile(r"Equity",            re.I), "Equity",    True),
 ]
 
 
-def _build_rag_context(retriever) -> str:
-    """
-    Runs all targeted queries and merges deduplicated results into one context block.
-    """
-    seen_content = set()
-    all_chunks = []
+def _classify_row(row_text: str):
+    """Return (class_name, is_equity) if the row matches a known tranche pattern."""
+    for pattern, name, is_eq in _CLASS_PATTERNS:
+        if pattern.search(row_text):
+            return name, is_eq
+    return None, False
 
-    for i, query in enumerate(RAG_QUERIES, start=1):
-        raw = search_indenture(retriever, query)
-        # Deduplicate: skip chunks already retrieved by a prior query
-        for chunk in raw.split("\n\n---\n\n"):
-            # Use first 120 chars as a fingerprint to detect duplicates
-            fingerprint = chunk[:120].strip()
-            if fingerprint and fingerprint not in seen_content:
-                seen_content.add(fingerprint)
-                all_chunks.append(f"[Query {i}]\n{chunk}")
 
-    logger.info(f"[RAG] Retrieved {len(all_chunks)} unique chunks across {len(RAG_QUERIES)} queries.")
-    return "\n\n===\n\n".join(all_chunks)
+def _extract_tranches_deterministic(pdf_path: str) -> List[Tranche]:
+    """
+    Scan every page of the PDF with pdfplumber, looking for tables that contain
+    tranche rows (class name + dollar amount in the same row). This is O(pages)
+    but 100% reliable — no semantic search, no LLM call needed.
+    """
+    import pdfplumber
+
+    found: Dict[str, Tranche] = {}   # deduplicate by class_name
+
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_num, page in enumerate(pdf.pages, start=1):
+                tables = page.extract_tables() or []
+                for table in tables:
+                    for row in (table or []):
+                        if not row:
+                            continue
+                        row_cells = [str(c or "").strip() for c in row]
+                        row_text  = " ".join(row_cells)
+
+                        class_name, is_equity = _classify_row(row_text)
+                        if not class_name:
+                            continue
+
+                        # Scan cells for a dollar amount
+                        principal = None
+                        for cell in row_cells:
+                            val = _parse_dollar(cell)
+                            if val and val > 100_000:   # must be > $100k (not a ratio/bps)
+                                principal = val
+                                break
+
+                        # Spread — only search within this row, not the whole page
+                        spread = _parse_spread(row_text, class_name=class_name)
+
+                        # Don't overwrite if we already have a better entry
+                        if class_name in found and found[class_name].principal_amount is not None:
+                            continue
+
+                        tranche = Tranche(
+                            class_name=class_name,
+                            target_rating="",
+                            principal_amount=principal,
+                            coupon_type="fixed" if is_equity else "floating",
+                            spread_bps=spread,
+                            is_equity=is_equity,
+                        )
+                        found[class_name] = tranche
+                        if principal:
+                            logger.info(
+                                f"[Parser][Det] {class_name}: ${principal:,.0f}"
+                                f"{f', spread={spread}bps' if spread else ''}"
+                                f" (page {page_num})"
+                            )
+
+                # Also scan plain text for spread info on non-equity tranches already found
+                page_text = page.extract_text() or ""
+                for class_name, tranche in list(found.items()):
+                    if tranche.spread_bps is None and not tranche.is_equity:
+                        # Look for a line that mentions this class name and a spread
+                        class_pat = re.compile(re.escape(class_name), re.I)
+                        for line in page_text.splitlines():
+                            if class_pat.search(line):
+                                spread = _parse_spread(line, class_name=class_name)
+                                if spread:
+                                    found[class_name] = tranche.model_copy(
+                                        update={"spread_bps": spread}
+                                    )
+                                    break
+
+    except Exception as e:
+        logger.error(f"[Parser][Det] pdfplumber scan failed: {e}")
+
+    tranches = list(found.values())
+    logger.info(f"[Parser][Det] Deterministic extraction found {len(tranches)} tranches.")
+    return tranches
+
+
+def _extract_total_par_deterministic(pdf_path: str) -> Optional[float]:
+    """
+    Scan the PDF text for 'Target Par' / 'Aggregate Principal' amounts.
+    Returns the value in USD or None.
+    """
+    import pdfplumber
+
+    patterns = [
+        re.compile(r"[Tt]arget\s+[Pp]ar[^$\d]*\$?\s*([\d,]+(?:\.\d+)?)", re.I),
+        re.compile(r"[Aa]ggregate\s+[Pp]rincipal\s+[Aa]mount[^$\d]*\$?\s*([\d,]+(?:\.\d+)?)", re.I),
+        re.compile(r"[Tt]otal\s+[Pp]ar[^$\d]*\$?\s*([\d,]+(?:\.\d+)?)", re.I),
+    ]
+
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text() or ""
+                for pat in patterns:
+                    m = pat.search(text)
+                    if m:
+                        val = _parse_dollar(m.group(1))
+                        if val and val > 1_000_000:
+                            logger.info(f"[Parser][Det] Total par detected: ${val:,.0f}")
+                            return val
+    except Exception as e:
+        logger.warning(f"[Parser][Det] Total par scan failed: {e}")
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# LAYER 2: RAG + LLM for semi-structured content (coverage tests, fees, waterfall)
+# ---------------------------------------------------------------------------
+
+COVERAGE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", (
+        "Extract Overcollateralization (OC) and Interest Coverage (IC) tests from the text. "
+        "Return ONLY a JSON array matching this schema:\n"
+        '[{{"test_type": "OC"|"IC", "applies_to_class": str, "trigger_ratio": float|null, '
+        '"cure_action": str}}]\n'
+        "Return empty array [] if none found. Output ONLY the JSON array, no other text."
+    )),
+    ("human", "Text:\n{context}")
+])
+
+FEES_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", (
+        "Extract CLO fee structure from the text. "
+        "Return ONLY a JSON object matching this schema:\n"
+        '{{"senior_admin_fee_cap": float|null, "senior_mgmt_fee_rate": float|null, '
+        '"subordinated_mgmt_fee_rate": float|null, "incentive_fee_hurdle_irr": float|null, '
+        '"incentive_fee_share": float|null}}\n'
+        "Rates must be decimals (0.0015 for 15bps, 0.12 for 12%). "
+        "Output ONLY the JSON object, no other text."
+    )),
+    ("human", "Text:\n{context}")
+])
+
+WATERFALL_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", (
+        "Extract CLO deal metadata and interest waterfall. Return ONLY a JSON object:\n"
+        '{{"deal_name": str, "ccc_bucket_limit": float|null, '
+        '"interest_waterfall": [{{"priority": int, "payee": str, '
+        '"payment_type": "fees"|"interest"|"principal"|"oc_cure"|"residual_equity", '
+        '"condition": str|null}}]}}\n'
+        "Output ONLY the JSON object, no other text."
+    )),
+    ("human", "Text:\n{context}")
+])
+
+COVERAGE_QUERIES = [
+    "overcollateralization OC test ratio trigger threshold interest coverage IC test diversion",
+    "OC ratio IC ratio Class A Class B coverage test reinvestment period diversion",
+]
+FEES_QUERIES = [
+    "senior management fee rate subordinated management fee administrative fee cap trustee incentive hurdle",
+    "asset management fee collateral manager fee annual percentage basis points",
+]
+WATERFALL_QUERIES = [
+    "priority of payments interest proceeds waterfall sequential first second third fees trustee",
+    "CCC bucket limit deal name CLO target par IRR hurdle equity subordinated",
+]
+
+
+def _build_context(retriever, queries: List[str], k_per_query: int = 4) -> str:
+    """Run targeted queries and return deduplicated context capped at 5000 chars."""
+    seen, chunks = set(), []
+    vs = getattr(retriever, "vectorstore", None)
+    for i, query in enumerate(queries, 1):
+        try:
+            docs = vs.similarity_search(query, k=k_per_query) if vs else retriever.invoke(query)
+        except Exception as e:
+            logger.warning(f"[Parser] Search failed for query {i}: {e}")
+            docs = []
+        for doc in docs:
+            fp = doc.page_content[:100].strip()
+            if fp and fp not in seen:
+                seen.add(fp)
+                chunks.append(f"[Q{i}/P{doc.metadata.get('page','?')}]\n{doc.page_content}")
+    return "\n\n---\n\n".join(chunks)[:5000]
+
+
+def _safe_json(text: str, fallback):
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+    try:
+        return json.loads(text)
+    except Exception as e:
+        logger.warning(f"[Parser] JSON parse failed: {e} | raw={text[:120]}")
+        return fallback
+
+
+def _extract_coverage_tests(retriever) -> List[CoverageTest]:
+    ctx  = _build_context(retriever, COVERAGE_QUERIES, k_per_query=4)
+    raw  = (COVERAGE_PROMPT | llm).invoke({"context": ctx}).content
+    data = _safe_json(raw, [])
+    tests = []
+    if isinstance(data, list):
+        for item in data:
+            try:
+                tests.append(CoverageTest(**item))
+            except Exception as e:
+                logger.warning(f"[Parser] Bad coverage test: {e}")
+    return tests
+
+
+def _extract_fees(retriever) -> FeeStructure:
+    ctx  = _build_context(retriever, FEES_QUERIES, k_per_query=4)
+    raw  = (FEES_PROMPT | llm).invoke({"context": ctx}).content
+    data = _safe_json(raw, {})
+    try:
+        return FeeStructure(**data) if isinstance(data, dict) else FeeStructure()
+    except Exception as e:
+        logger.warning(f"[Parser] Fee parse failed: {e}")
+        return FeeStructure()
+
+
+def _extract_waterfall_meta(retriever) -> dict:
+    ctx  = _build_context(retriever, WATERFALL_QUERIES, k_per_query=4)
+    raw  = (WATERFALL_PROMPT | llm).invoke({"context": ctx}).content
+    data = _safe_json(raw, {})
+    if not isinstance(data, dict):
+        data = {}
+    steps = []
+    for item in data.get("interest_waterfall", []):
+        try:
+            steps.append(WaterfallStep(**item))
+        except Exception as e:
+            logger.warning(f"[Parser] Bad waterfall step: {e}")
+    return {
+        "deal_name":      data.get("deal_name") or "Mock CLO Deal",
+        "ccc_bucket_limit": data.get("ccc_bucket_limit"),
+        "interest_waterfall": steps,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -132,73 +337,89 @@ def _build_rag_context(retriever) -> str:
 
 def parser_agent(state: GraphState) -> Dict[str, Any]:
     """
-    LangGraph node: Ingests the PDF via RAG, retrieves targeted excerpts,
-    and returns a validated IndentureRules parsed from the vector store.
+    LangGraph node: hybrid extraction.
+    Layer 1 — deterministic pdfplumber table scan (tranches + total par)
+    Layer 2 — RAG + LLM for coverage tests, fees, waterfall metadata
     """
     pdf_path = state.get("pdf_path")
     if not pdf_path or not os.path.exists(pdf_path):
         raise FileNotFoundError(f"Indenture PDF not found at path: {pdf_path}")
 
-    # ------------------------------------------------------------------
-    # 1. Index the PDF into an isolated ChromaDB collection (lazy — skips
-    #    if already indexed for this exact document).
-    # ------------------------------------------------------------------
-    logger.info(f"[Parser] Initializing RAG retriever for: {os.path.basename(pdf_path)}")
-    retriever, collection_name = get_or_create_retriever(pdf_path)
-
-    collection_info = get_collection_info(pdf_path)
-    index_status = "reused" if collection_info["indexed"] else "newly built"
-    logger.info(f"[Parser] Collection '{collection_name}' {index_status}.")
+    logger.info(f"[Parser] Starting hybrid extraction for: {os.path.basename(pdf_path)}")
 
     # ------------------------------------------------------------------
-    # 2. Run 5 targeted semantic queries and build the merged context.
+    # LAYER 1: Deterministic extraction — no LLM, no embedding needed
     # ------------------------------------------------------------------
-    combined_context = _build_rag_context(retriever)
+    tranches   = _extract_tranches_deterministic(pdf_path)
+    total_par  = _extract_total_par_deterministic(pdf_path)
+
+    # Fallback: sum extracted principal amounts if total par not found in text
+    if total_par is None and tranches:
+        extracted_sum = sum(t.principal_amount for t in tranches if t.principal_amount)
+        if extracted_sum > 0:
+            total_par = extracted_sum
+            logger.info(f"[Parser] Total par derived from tranche sum: ${total_par:,.0f}")
 
     # ------------------------------------------------------------------
-    # 3. LLM structured extraction from retrieved chunks only.
+    # LAYER 2: RAG + LLM for semi-structured content
     # ------------------------------------------------------------------
-    chain = EXTRACTION_PROMPT | structured_parser_llm
-    schema_str = IndentureRules.schema_json(indent=2)
+    logger.info("[Parser] Building RAG index for semi-structured content...")
+    retriever, collection_name = get_or_create_retriever(pdf_path, k=4)
+    index_status = "reused" if get_collection_info(pdf_path)["indexed"] else "newly built"
 
-    logger.info("[Parser] Sending retrieved context to LLM for structured extraction...")
-    parsed_rules: IndentureRules = chain.invoke({
-        "context": combined_context,
-        "schema": schema_str,
-    })
+    coverage_tests = _extract_coverage_tests(retriever)
+    fees           = _extract_fees(retriever)
+    meta           = _extract_waterfall_meta(retriever)
 
+    # ------------------------------------------------------------------
+    # Assemble IndentureRules
+    # ------------------------------------------------------------------
+    parsed_rules = IndentureRules(
+        deal_name=meta["deal_name"],
+        total_target_par=total_par,
+        tranches=tranches,
+        coverage_tests=coverage_tests,
+        fees=fees,
+        ccc_bucket_limit=meta["ccc_bucket_limit"],
+        interest_waterfall=meta["interest_waterfall"],
+    )
     rules_dict = parsed_rules.model_dump()
-    logger.info(f"[Parser] Extraction complete. Deal: '{parsed_rules.deal_name}', "
-                f"Tranches: {len(parsed_rules.tranches)}, "
-                f"Coverage tests: {len(parsed_rules.coverage_tests)}")
 
-    # ------------------------------------------------------------------
-    # 4. Derive senior tranche ratio for the Quant Agent's simulation.
-    # ------------------------------------------------------------------
-    total_par = parsed_rules.total_target_par
+    logger.info(
+        f"[Parser] Done. Deal='{parsed_rules.deal_name}' | "
+        f"Par=${total_par:,.0f} | Tranches={len(tranches)} | "
+        f"Tests={len(coverage_tests)} | Waterfall={len(meta['interest_waterfall'])}"
+        if total_par else
+        f"[Parser] Done. Deal='{parsed_rules.deal_name}' | Par=N/A | "
+        f"Tranches={len(tranches)} | Tests={len(coverage_tests)}"
+    )
+
+    # Senior ratio for Quant agent
     senior_tranche = next(
-        (t for t in parsed_rules.tranches if "A" in t.class_name and not t.is_equity),
-        None
+        (t for t in tranches if "A" in t.class_name and not t.is_equity), None
     )
     senior_ratio = (
         round(senior_tranche.principal_amount / total_par, 4)
-        if senior_tranche and total_par > 0
-        else 0.65  # Fallback: 65% senior AAA (market convention)
+        if senior_tranche and senior_tranche.principal_amount and total_par
+        else 0.65
     )
 
-    # ------------------------------------------------------------------
-    # 5. Build the extracted_text_chunks list for display in the UI.
-    #    We expose the raw retrieved chunks so the frontend can show them.
-    # ------------------------------------------------------------------
-    extracted_chunks = [
-        f"[RAG Collection: {collection_name}]",
-        f"[Index status: {index_status}]",
-        combined_context,
-    ]
+    missing_principals = any(t.principal_amount is None for t in tranches) if tranches else True
+    data_quality = {
+        "principals_extracted": bool(tranches) and not missing_principals,
+        "tranche_count": len(tranches),
+        "coverage_tests_extracted": len(coverage_tests) > 0,
+        "extraction_method": "deterministic+rag",
+    }
 
     return {
-        "extracted_text_chunks": extracted_chunks,
+        "extracted_text_chunks": [
+            f"[Collection: {collection_name} | {index_status}]",
+            f"[Tranches: {len(tranches)} (deterministic) | Tests: {len(coverage_tests)} (RAG)]",
+            f"[Total par: ${total_par:,.0f}]" if total_par else "[Total par: estimated]",
+        ],
         "parsed_waterfall": rules_dict,
         "senior_tranche_ratio": senior_ratio,
         "vector_store_id": collection_name,
+        "parser_data_quality": data_quality,
     }

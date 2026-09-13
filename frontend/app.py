@@ -200,7 +200,10 @@ def load_thread_state(thread_id: str) -> Optional[dict]:
         return None
 
 
-def fmt_money(val: float) -> str:
+def fmt_money(val) -> str:
+    if val is None:
+        return "N/A"
+    val = float(val)
     if val >= 1_000_000_000:
         return f"${val/1_000_000_000:.2f}B"
     if val >= 1_000_000:
@@ -342,10 +345,10 @@ def _view_code_modal(title: str, code: str):
 
 def _parser_card(state: dict):
     pw = state.get("parsed_waterfall") or {}
-    deal  = pw.get("deal_name", "—")
-    par   = pw.get("total_target_par", 0)
-    n_tr  = len(pw.get("tranches", []))
-    n_ct  = len(pw.get("coverage_tests", []))
+    deal  = pw.get("deal_name") or "—"
+    par   = pw.get("total_target_par") or 0
+    n_tr  = len(pw.get("tranches") or [])
+    n_ct  = len(pw.get("coverage_tests") or [])
     vec   = state.get("vector_store_id", "—")
 
     with st.container(border=True):
@@ -358,6 +361,19 @@ def _parser_card(state: dict):
 
         if st.button("📋 View Extracted IndentureRules JSON", key="btn_parser_json"):
             _view_json_modal("Extracted IndentureRules JSON", pw)
+
+        # ── Data quality warning ──────────────────────────────────────────
+        dq = state.get("parser_data_quality") or {}
+        if dq and not dq.get("principals_extracted", True):
+            st.warning(
+                "⚠️ **Principal amounts could not be extracted from the PDF.** "
+                "The simulation will use estimated proportional fallbacks. "
+                "Results are **not based on the actual deal terms** — "
+                "try clearing the vector index and re-running for better extraction.",
+                icon="⚠️",
+            )
+        elif dq and dq.get("principals_extracted"):
+            st.success("✅ Tranche principal amounts successfully extracted from the document.")
 
         st.caption(f"🗄️ Vector Store Collection: `{vec}`")
 
@@ -473,8 +489,9 @@ def display_chat_interface(thread_id: str, workflow_state: dict):
 
     # Inject context if starting fresh
     if not messages:
-        pdf_path = workflow_state.get("pdf_path", "")
-        deal_name = workflow_state.get("parsed_waterfall", {}).get("deal_name", "Unknown Deal")
+        pdf_path = workflow_state.get("pdf_path") or ""
+        pw = workflow_state.get("parsed_waterfall") or {}
+        deal_name = pw.get("deal_name") or "Unknown Deal"
         system_injection = (
             f"[System Context]\n"
             f"Active PDF Path: `{pdf_path}`\n"
@@ -614,8 +631,8 @@ def run_streaming_analysis(pdf_path: str):
             if node_name == "parser_node":
                 pw   = output.get("parsed_waterfall") or {}
                 deal = pw.get("deal_name", "Unknown Deal")
-                par  = pw.get("total_target_par", 0)
-                n_tr = len(pw.get("tranches", []))
+                par  = pw.get("total_target_par") or 0
+                n_tr = len(pw.get("tranches") or [])
                 vec  = output.get("vector_store_id", "—")
                 st.write(
                     f"✅ **Parser Agent** — *{deal}* · "

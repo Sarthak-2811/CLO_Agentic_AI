@@ -34,3 +34,6 @@ class GraphState(TypedDict):
 
     # Final Executive Summary (from Reporter Node)
     final_report: Optional[str]
+
+    # Data quality metadata (from Parser Node) — tracks whether extraction was complete
+    parser_data_quality: Optional[Dict[str, Any]]

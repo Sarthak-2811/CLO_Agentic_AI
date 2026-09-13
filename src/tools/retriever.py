@@ -6,14 +6,16 @@ Design:
 - Switching PDFs = different collection = zero data bleed between documents.
 - Same PDF uploaded again = collection already exists → skip re-embedding instantly.
 - Local HuggingFace embeddings (all-MiniLM-L6-v2) run on CPU at zero cost.
+- Uses pdfplumber for table-aware extraction so values like "$399,000,000" stay
+  attached to their row labels (e.g. "Class A-1 Notes") within the same chunk.
 """
 
 import os
 import hashlib
 import logging
-from typing import Optional
+from typing import Optional, List
 
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
@@ -21,7 +23,6 @@ from langchain_chroma import Chroma
 logger = logging.getLogger(__name__)
 
 # Root directory where ALL ChromaDB collections are persisted.
-# Each PDF collection lives in its own subdirectory underneath this.
 CHROMA_DB_ROOT = "./data/vector_store"
 
 # Shared embedding model (loaded once, reused across all calls in the process)
@@ -43,19 +44,8 @@ def _get_embeddings() -> HuggingFaceEmbeddings:
 
 
 def _collection_name_for_pdf(pdf_path: str) -> str:
-    """
-    Derives a stable, unique ChromaDB collection name from the PDF filename.
-
-    Uses a short SHA-256 hash of the *basename* (not the full path) so that
-    moving the file doesn't invalidate the existing index.
-
-    ChromaDB collection names must:
-    - Be 3–63 characters
-    - Contain only alphanumerics, underscores, and hyphens
-    - Not start/end with a hyphen or underscore
-    """
+    """Derives a stable, unique ChromaDB collection name from the PDF filename."""
     basename = os.path.basename(pdf_path)
-    # Remove extension, sanitise special chars → safe prefix
     safe_stem = "".join(c if c.isalnum() else "_" for c in os.path.splitext(basename)[0])[:24]
     short_hash = hashlib.sha256(basename.encode()).hexdigest()[:12]
     return f"{safe_stem}_{short_hash}"
@@ -67,16 +57,107 @@ def _persist_dir_for_collection(collection_name: str) -> str:
 
 
 def _collection_exists(collection_name: str) -> bool:
-    """
-    Returns True if this collection has already been embedded and persisted.
-    We check for the presence of the ChromaDB SQLite file as the indicator.
-    """
+    """Returns True if this collection has already been embedded and persisted."""
     persist_dir = _persist_dir_for_collection(collection_name)
     chroma_db_file = os.path.join(persist_dir, "chroma.sqlite3")
     return os.path.isfile(chroma_db_file)
 
 
-def get_or_create_retriever(pdf_path: str, k: int = 8):
+# ---------------------------------------------------------------------------
+# Table-aware document loading via pdfplumber
+# ---------------------------------------------------------------------------
+
+def _table_row_to_text(row: list) -> str:
+    """Convert a pdfplumber table row (list of cell strings) to a pipe-separated string."""
+    return " | ".join(str(cell or "").strip() for cell in row)
+
+
+def _load_pdf_with_tables(pdf_path: str) -> List[Document]:
+    """
+    Load a PDF using pdfplumber. For each page:
+    - Extracts plain prose text
+    - Detects and reconstructs tables as structured rows ("Col A | Col B | Col C")
+    This keeps row labels (e.g. "Class A-1 Notes") next to their dollar values
+    ("$399,000,000") in the same text block so semantic search can find both.
+    """
+    import pdfplumber
+
+    docs: List[Document] = []
+
+    with pdfplumber.open(pdf_path) as pdf:
+        for page_num, page in enumerate(pdf.pages, start=1):
+            page_texts: List[str] = []
+
+            # --- Extract tables first (they have geometry-aware row reconstruction) ---
+            tables = page.extract_tables()
+            table_char_sets: set = set()  # track bboxes covered by tables
+
+            for table in tables:
+                if not table:
+                    continue
+                rows = []
+                for row in table:
+                    if row and any(cell for cell in row):
+                        rows.append(_table_row_to_text(row))
+                if rows:
+                    table_block = "\n".join(rows)
+                    page_texts.append(f"[TABLE]\n{table_block}")
+
+            # --- Extract remaining prose text ---
+            # Mask out table bounding boxes to avoid double-counting
+            table_bboxes = [t.bbox for t in page.find_tables()] if page.find_tables() else []
+            if table_bboxes:
+                # Crop to non-table regions
+                remaining = page
+                for bbox in table_bboxes:
+                    try:
+                        remaining = remaining.outside_bbox(bbox)
+                    except Exception:
+                        pass
+                prose = remaining.extract_text(x_tolerance=3, y_tolerance=3) or ""
+            else:
+                prose = page.extract_text(x_tolerance=3, y_tolerance=3) or ""
+
+            if prose.strip():
+                page_texts.append(prose.strip())
+
+            if page_texts:
+                combined = "\n\n".join(page_texts)
+                docs.append(Document(
+                    page_content=combined,
+                    metadata={"page": page_num, "source": os.path.basename(pdf_path)},
+                ))
+
+    logger.info(f"[RAG] pdfplumber extracted {len(docs)} pages.")
+    return docs
+
+
+def _load_pdf_fallback(pdf_path: str) -> List[Document]:
+    """Fallback: use LangChain's PyPDFLoader if pdfplumber fails."""
+    from langchain_community.document_loaders import PyPDFLoader
+    loader = PyPDFLoader(pdf_path)
+    docs = loader.load()
+    logger.info(f"[RAG] PyPDFLoader extracted {len(docs)} pages (fallback).")
+    return docs
+
+
+def _load_pdf(pdf_path: str) -> List[Document]:
+    """Try pdfplumber first, fall back to PyPDFLoader."""
+    try:
+        docs = _load_pdf_with_tables(pdf_path)
+        if docs:
+            return docs
+        logger.warning("[RAG] pdfplumber returned empty — falling back to PyPDFLoader.")
+    except Exception as e:
+        logger.warning(f"[RAG] pdfplumber failed ({e}) — falling back to PyPDFLoader.")
+    return _load_pdf_fallback(pdf_path)
+
+
+# ---------------------------------------------------------------------------
+# Main retriever entry point
+# ---------------------------------------------------------------------------
+
+def get_or_create_retriever(pdf_path: str, k: int = 4):
     """
     Main entry point: Returns a LangChain retriever backed by ChromaDB.
 
@@ -85,10 +166,10 @@ def get_or_create_retriever(pdf_path: str, k: int = 8):
 
     Args:
         pdf_path: Absolute or relative path to the CLO Indenture PDF.
-        k: Number of top-relevant chunks to retrieve per query (default: 8).
+        k: Number of top-relevant chunks to retrieve per query (default: 4).
 
     Returns:
-        A LangChain VectorStoreRetriever ready for semantic search.
+        (retriever, collection_name) — retriever is a LangChain VectorStoreRetriever.
     """
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(f"PDF not found at path: {pdf_path}")
@@ -108,22 +189,20 @@ def get_or_create_retriever(pdf_path: str, k: int = 8):
         logger.info(f"[RAG] Building new index '{collection_name}' for {os.path.basename(pdf_path)}...")
         os.makedirs(persist_dir, exist_ok=True)
 
-        # 1. Load all pages of the PDF
-        loader = PyPDFLoader(pdf_path)
-        docs = loader.load()
-        logger.info(f"[RAG] Loaded {len(docs)} pages from PDF.")
+        # 1. Load with table-aware extraction
+        docs = _load_pdf(pdf_path)
 
-        # 2. Chunk into 1000-char segments with 200-char overlap.
-        #    Legal docs have long clauses — overlap preserves cross-sentence context.
+        # 2. Chunk — prose gets 800-char chunks, but TABLE blocks are kept whole
+        #    (tables are usually <400 chars per page, so they rarely get split)
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
+            chunk_size=800,
+            chunk_overlap=150,
             separators=["\n\n", "\n", ". ", " ", ""],
         )
         splits = text_splitter.split_documents(docs)
         logger.info(f"[RAG] Split into {len(splits)} chunks.")
 
-        # 3. Embed and persist — each collection lives in its own subdirectory.
+        # 3. Embed and persist
         vectorstore = Chroma.from_documents(
             documents=splits,
             embedding=embeddings,
@@ -132,19 +211,17 @@ def get_or_create_retriever(pdf_path: str, k: int = 8):
         )
         logger.info(f"[RAG] Index '{collection_name}' built and persisted to {persist_dir}.")
 
-    return vectorstore.as_retriever(search_kwargs={"k": k}), collection_name
+    # Use MMR for diverse coverage across 300+ pages
+    retriever = vectorstore.as_retriever(
+        search_type="mmr",
+        search_kwargs={"k": k, "fetch_k": k * 5, "lambda_mult": 0.5},
+    )
+    return retriever, collection_name
 
 
 def search_indenture(retriever, query: str) -> str:
     """
     Executes a single semantic search and returns the combined text of top-k chunks.
-
-    Args:
-        retriever: A LangChain retriever returned by get_or_create_retriever().
-        query:     A natural-language description of the information to find.
-
-    Returns:
-        A single string of retrieved legal text chunks, separated by dividers.
     """
     relevant_docs = retriever.invoke(query)
     if not relevant_docs:
@@ -159,19 +236,17 @@ def search_indenture(retriever, query: str) -> str:
 def delete_collection(pdf_path: str) -> bool:
     """
     Deletes the ChromaDB collection for a given PDF, forcing re-indexing next time.
-
-    Args:
-        pdf_path: Path to the PDF whose index should be cleared.
-
-    Returns:
-        True if the collection existed and was deleted, False if it didn't exist.
     """
     import shutil
+    import chromadb
+
     collection_name = _collection_name_for_pdf(pdf_path)
     persist_dir = _persist_dir_for_collection(collection_name)
 
     if os.path.isdir(persist_dir):
-        shutil.rmtree(persist_dir)
+        if hasattr(chromadb.api.client.SharedSystemClient, "clear_system_cache"):
+            chromadb.api.client.SharedSystemClient.clear_system_cache()
+        shutil.rmtree(persist_dir, ignore_errors=True)
         logger.info(f"[RAG] Deleted collection '{collection_name}' at {persist_dir}.")
         return True
 
@@ -180,10 +255,7 @@ def delete_collection(pdf_path: str) -> bool:
 
 
 def get_collection_info(pdf_path: str) -> dict:
-    """
-    Returns metadata about a PDF's index (collection name, path, whether it exists).
-    Useful for displaying status in the Streamlit UI.
-    """
+    """Returns metadata about a PDF's index."""
     collection_name = _collection_name_for_pdf(pdf_path)
     persist_dir = _persist_dir_for_collection(collection_name)
     exists = _collection_exists(collection_name)
@@ -195,7 +267,6 @@ def get_collection_info(pdf_path: str) -> dict:
     }
 
     if exists:
-        # Estimate chunk count from the SQLite file size as a rough proxy
         db_file = os.path.join(persist_dir, "chroma.sqlite3")
         info["index_size_mb"] = round(os.path.getsize(db_file) / (1024 * 1024), 2)
 
