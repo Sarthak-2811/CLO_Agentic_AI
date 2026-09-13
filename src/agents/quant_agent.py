@@ -13,65 +13,6 @@ from src.tools.python_repl import execute_simulation_code
 
 logger = logging.getLogger(__name__)
 
-
-def _sanitize_rules(rules: dict) -> dict:
-    """
-    Fill in None / null values and ensure at least one tranche exists so the
-    Quant agent always has valid data to simulate.
-    """
-    import copy
-    rules = copy.deepcopy(rules)
-
-    total_par = rules.get("total_target_par") or 694_100_000.0  # sum of the 4 known tranches
-    rules["total_target_par"] = total_par
-
-    tranches = rules.get("tranches") or []
-
-    # If no tranches at all, create a standard 4-tranche CLO structure as fallback
-    if not tranches:
-        logger.warning("[Quant] No tranches from parser — using standard CLO fallback structure.")
-        tranches = [
-            {"class_name": "Class A-1", "principal_amount": 399_000_000.0,
-             "spread_bps": 158.0, "coupon_type": "floating", "is_equity": False, "target_rating": "AAA"},
-            {"class_name": "Class A-2", "principal_amount": 35_000_000.0,
-             "spread_bps": 175.0, "coupon_type": "floating", "is_equity": False, "target_rating": "AA"},
-            {"class_name": "Class B",   "principal_amount": 42_000_000.0,
-             "spread_bps": 185.0, "coupon_type": "floating", "is_equity": False, "target_rating": "A"},
-            {"class_name": "Subordinated Notes", "principal_amount": 218_100_000.0,
-             "spread_bps": None, "coupon_type": "fixed", "is_equity": True, "target_rating": "NR"},
-        ]
-
-    # Fill in any None values on existing tranches
-    DEFAULT_RATIOS = [0.57, 0.05, 0.06, 0.31]
-    n = len(tranches)
-    for idx, t in enumerate(tranches):
-        if t.get("principal_amount") is None:
-            ratio = DEFAULT_RATIOS[idx] if idx < len(DEFAULT_RATIOS) else (1.0 / n)
-            t["principal_amount"] = round(total_par * ratio, 0)
-        if t.get("spread_bps") is None and not t.get("is_equity"):
-            t["spread_bps"] = 150.0
-
-    rules["tranches"] = tranches
-
-    # FeeStructure fallbacks
-    fees = rules.get("fees") or {}
-    fees.setdefault("senior_admin_fee_cap",        200_000.0)
-    fees.setdefault("senior_mgmt_fee_rate",        0.0015)
-    fees.setdefault("subordinated_mgmt_fee_rate",  0.0035)
-    fees.setdefault("incentive_fee_hurdle_irr",    0.12)
-    fees.setdefault("incentive_fee_share",         0.20)
-    for k, v in fees.items():
-        if v is None:
-            fees[k] = {"senior_admin_fee_cap": 200_000.0, "senior_mgmt_fee_rate": 0.0015,
-                       "subordinated_mgmt_fee_rate": 0.0035, "incentive_fee_hurdle_irr": 0.12,
-                       "incentive_fee_share": 0.20}[k]
-    rules["fees"] = fees
-
-    rules["ccc_bucket_limit"] = rules.get("ccc_bucket_limit") or 0.075
-
-    return rules
-
-
 def quant_agent(state: GraphState) -> Dict[str, Any]:
     """
     Generates and executes a Python Monte Carlo simulation based on Indenture Rules.
@@ -80,11 +21,10 @@ def quant_agent(state: GraphState) -> Dict[str, Any]:
     rules = state.get("parsed_waterfall")
     if not rules:
         return {"status": "failed", "execution_error": "No indenture rules found in state."}
-
-    # ── Sanitize rules: fill in None principal_amounts with estimated fallbacks ──
-    # The LLM may return null for principal_amount when data is scattered across the PDF.
-    # We use a proportional fallback so the Quant agent always has valid float values.
-    rules = _sanitize_rules(rules)
+        
+    tranches = rules.get("tranches", [])
+    if not tranches:
+        return {"status": "failed", "execution_error": "No tranches found in parsed waterfall rules. Cannot run simulation."}
 
     # Prepare inputs — rules is already a dict from the parser's .model_dump()
     rules_json = json.dumps(rules, indent=2)
@@ -116,6 +56,7 @@ RULES:
 8. DO NOT embed the raw JSON string in your code. Instead, extract the specific tranche sizes, spreads, and triggers from the provided rules and define them directly as Python variables (e.g. `tranche_A_size = 100000000`).
 9. Output ONLY pure Python code. Do not wrap it in markdown block quotes (```python). Just the code.
 10. You MUST include `import json`, `import numpy as np`, and `import pandas as pd` at the top of your script.
+11. NO HARDCODED ASSUMPTIONS: If any parameters (like spread, triggers, or fees) are null in the JSON, do NOT invent standard market rates. Treat them as 0 or exclude them from the waterfall.
 """
 
     prompt = ChatPromptTemplate.from_messages([

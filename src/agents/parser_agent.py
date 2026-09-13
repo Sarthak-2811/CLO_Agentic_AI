@@ -325,7 +325,7 @@ def _extract_waterfall_meta(retriever) -> dict:
         except Exception as e:
             logger.warning(f"[Parser] Bad waterfall step: {e}")
     return {
-        "deal_name":      data.get("deal_name") or "Mock CLO Deal",
+        "deal_name":      data.get("deal_name") or "Unknown Deal",
         "ccc_bucket_limit": data.get("ccc_bucket_limit"),
         "interest_waterfall": steps,
     }

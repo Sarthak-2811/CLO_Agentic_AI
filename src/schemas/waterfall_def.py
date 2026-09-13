@@ -54,23 +54,23 @@ class CoverageTest(BaseModel):
 class FeeStructure(BaseModel):
     """Senior fees, management fees, and administrative caps."""
     senior_admin_fee_cap: Optional[float] = Field(
-        default=200000.0,
+        default=None,
         description="Annual dollar cap on trustee and administrative expenses. Return null if not found."
     )
     senior_mgmt_fee_rate: Optional[float] = Field(
-        default=0.0015,
+        default=None,
         description="Senior management fee rate as a decimal of collateral balance (e.g., 0.0015 = 15 bps). Return null if not found."
     )
     subordinated_mgmt_fee_rate: Optional[float] = Field(
-        default=0.0035,
+        default=None,
         description="Subordinated management fee rate as a decimal (e.g., 0.0035 = 35 bps). Return null if not found."
     )
     incentive_fee_hurdle_irr: Optional[float] = Field(
-        default=0.12,
+        default=None,
         description="Equity IRR hurdle before incentive fee applies (e.g., 0.12 = 12%). Return null if not found."
     )
     incentive_fee_share: Optional[float] = Field(
-        default=0.20,
+        default=None,
         description="Manager share of residual cash flow above the hurdle (e.g., 0.20 = 20%). Return null if not found."
     )
 
@@ -83,19 +83,19 @@ class FeeStructure(BaseModel):
         return v  # None is now acceptable; pydantic stores None as-is
 
     def effective_senior_admin_fee_cap(self) -> float:
-        return self.senior_admin_fee_cap if self.senior_admin_fee_cap is not None else 200000.0
+        return self.senior_admin_fee_cap
 
     def effective_senior_mgmt_fee_rate(self) -> float:
-        return self.senior_mgmt_fee_rate if self.senior_mgmt_fee_rate is not None else 0.0015
+        return self.senior_mgmt_fee_rate
 
     def effective_subordinated_mgmt_fee_rate(self) -> float:
-        return self.subordinated_mgmt_fee_rate if self.subordinated_mgmt_fee_rate is not None else 0.0035
+        return self.subordinated_mgmt_fee_rate
 
     def effective_incentive_fee_hurdle_irr(self) -> float:
-        return self.incentive_fee_hurdle_irr if self.incentive_fee_hurdle_irr is not None else 0.12
+        return self.incentive_fee_hurdle_irr
 
     def effective_incentive_fee_share(self) -> float:
-        return self.incentive_fee_share if self.incentive_fee_share is not None else 0.20
+        return self.incentive_fee_share
 
 
 class WaterfallStep(BaseModel):
@@ -118,11 +118,11 @@ class WaterfallStep(BaseModel):
 class IndentureRules(BaseModel):
     """Complete parsed financial model extracted from the legal indenture."""
     deal_name: str = Field(
-        default="Mock CLO Deal",
+        default="Unknown Deal",
         description="Name of the CLO vehicle, e.g., 'Octagon Investment Partners XLV'"
     )
     total_target_par: Optional[float] = Field(
-        default=400000000.0,
+        default=None,
         description="Total collateral asset pool target balance in USD (e.g., 400000000.0). Return null if not found."
     )
     tranches: List[Tranche] = Field(
@@ -138,7 +138,7 @@ class IndentureRules(BaseModel):
         description="Fee caps and management payment rates"
     )
     ccc_bucket_limit: Optional[float] = Field(
-        default=0.075,
+        default=None,
         description="Maximum portfolio allowance for CCC-rated loans before haircutting (default 7.5%)"
     )
     interest_waterfall: List[WaterfallStep] = Field(
@@ -151,4 +151,4 @@ class IndentureRules(BaseModel):
         if self.total_target_par:
             return self.total_target_par
         principals = [t.principal_amount for t in self.tranches if t.principal_amount]
-        return sum(principals) if principals else 400_000_000.0
+        return sum(principals) if principals else None

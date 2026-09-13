@@ -56,13 +56,24 @@ def critic_agent(state: GraphState) -> Dict[str, Any]:
 
     # If the senior tranche fails the stress test
     if senior_loss_prob > AAA_LOSS_THRESHOLD:
-        system_prompt = (
-            "You are a Senior Credit Officer at a Major Rating Agency (Moody's / S&P).\n"
-            "The CLO model FAILED the AAA stress benchmark.\n"
-            "Your task is to give precise, actionable instructions to the Quant to re-structure the capital pool.\n"
-            "Advise reducing the Senior tranche size by 2% to 4% and increasing junior/equity subordination."
-        )
-        
+        system_prompt = """You are the Lead Structuring Quant and Credit Evaluator for a major investment bank, tasked with stress-testing a CLO structure and ensuring it meets rating agency criteria.
+
+Your objective is to evaluate the Monte Carlo simulation results provided by the Quant Node and issue structured feedback. If the model fails, you must mandate dynamic, real-world structural adjustments to fix it.
+
+CRITICAL RULES & CONSTRAINTS:
+1. NO HARDCODED ASSUMPTIONS: You must ONLY use the tranche sizes, interest rates, Overcollateralization (OC) triggers, Interest Coverage (IC) triggers, and fee caps exactly as they were extracted from the PDF into the `IndentureRules` JSON. Do not invent standard market rates.
+2. ZERO-SUM CAPITAL STRUCTURE: The Total Target Par of the collateral pool is strictly fixed. If you instruct the Quant to reduce the size of the Senior Tranche to create a safer OC ratio, you MUST instruct the Quant to increase the Subordinated/Equity Tranche (or a Junior Tranche) by the exact same dollar amount. The total capital structure must always sum to the original total.
+3. RATING THRESHOLD: The probability of loss for the most senior tranche (e.g., Class A-1 / AAA) must be <= 0.01% (0.0001).
+
+STRATEGY FOR REJECTION (DYNAMIC STRUCTURING):
+If the Senior Tranche fails the stress test (loss > 0.01%), DO NOT simply tell the Quant to blindly lower numbers. You must employ dynamic cash flow structuring strategies used in real CLO Indentures:
+*   Strategy A (Interest Diversion / Cash Sweep): Instruct the Quant to implement a strict "cash sweep" mechanism in their Python script. If an OC or IC test is breached during a simulation path, the script must IMMEDIATELY halt all dividend payments (Residual Interest) to the Subordinated/Equity investors.
+*   Strategy B (Senior Amortization): Instruct the Quant to redirect those halted equity dividends directly to the Senior Tranche to pay down its principal balance rapidly. 
+*   Strategy C (Cure & Resume): Instruct the Quant that once the Senior principal is paid down enough that the OC/IC ratio returns to a passing level, the normal flow of the waterfall should resume.
+
+YOUR OUTPUT FORMAT:
+If the results fail, provide step-by-step instructions for the Quant detailing exactly which dynamic strategy (A, B, or C) to code into their Python loop and which tranche sizes to adjust (remembering the zero-sum rule)."""
+
         results_str = json.dumps(results).replace("{", "{{").replace("}", "}}")
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_prompt),
@@ -72,7 +83,7 @@ def critic_agent(state: GraphState) -> Dict[str, Any]:
                 f"Maximum Allowed Threshold: {AAA_LOSS_THRESHOLD:.4f}\n"
                 f"Full Simulation Results: {results_str}\n"
                 f"Iteration: {iteration}\n\n"
-                "Provide brief, concrete mathematical feedback on how to resize the tranches."
+                "Provide exact structuring strategies and Python logic instructions to the Quant to fix this structure."
             ))
         ])
         
